@@ -1,0 +1,23 @@
+# Environment variables (never commit real keys)
+.env
+
+# Data files — often contain PII or sensitive lead data
+*.csv
+*.xlsx
+*.xls
+*.json
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
