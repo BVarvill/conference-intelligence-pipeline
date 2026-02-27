@@ -1,24 +1,32 @@
 """
-generate_emails.py
-==================
-Generates personalised outreach emails for APA TV leads.
-Reads outreach_clear.json, uses Serper for recent company news,
-Groq to write the tailored hook paragraph, outputs one email per lead.
+Generate personalised outreach emails for APA TV leads.
 
-Output: emails/ folder with one .txt file per lead + emails_all.csv
+Reads the scored lead data from outreach_clear.json, searches Serper for recent
+institution news, then uses Groq to write a tailored hook sentence for each lead.
+Outputs one .txt email per lead plus an emails_draft.csv summary.
+
+Usage:
+  python generate_emails.py
+
+API keys (set as environment variables — see .env.example):
+  GROQ_API_KEY, SERPER_API_KEY
 """
 
-import json, os, re, time, requests
+import json
+import os
+import re
+import time
+import requests
+import pandas as pd
 from groq import Groq
 
-# ── Keys ──────────────────────────────────────────────────────────────────────
-GROQ_KEY   = os.environ.get("GROQ_API_KEY",   "")
+
+GROQ_KEY   = os.environ.get("GROQ_API_KEY", "")
 SERPER_KEY = os.environ.get("SERPER_API_KEY", "")
 
 groq_client = Groq(api_key=GROQ_KEY)
 
-# ── YouTube links by category ─────────────────────────────────────────────────
-# Used to pick 3-4 most relevant examples per lead
+# YouTube example links grouped by institution type — 3-4 shown per email
 YT_LINKS = {
     "pharma": [
         "Circular Genomics: https://www.youtube.com/watch?v=M0ie-UvxMxM",
@@ -49,26 +57,27 @@ YT_LINKS = {
     ],
 }
 
+
 def pick_links(institution_type: str, title: str, institution: str) -> str:
-    """Pick 3-4 most relevant YouTube examples based on institution type."""
-    t = institution_type.lower()
+    """Pick 3-4 YouTube example links relevant to the institution type."""
+    t  = institution_type.lower()
     ti = (title + " " + institution).lower()
 
     if t == "company":
-        # Pharma vs digital health
-        if any(w in ti for w in ["pharma","therapeut","bioscience","biotech","drug","medicine","clinical","biogen","otsuka","janssen","alkermes","takeda","sage","neurocrine","indivior"]):
-            links = YT_LINKS["pharma"][:4]
-        else:
-            links = YT_LINKS["digital_health"][:4]
+        pharma_terms = [
+            "pharma", "therapeut", "bioscience", "biotech", "drug", "medicine",
+            "clinical", "biogen", "otsuka", "janssen", "alkermes", "takeda",
+            "sage", "neurocrine", "indivior",
+        ]
+        links = YT_LINKS["pharma"][:4] if any(w in ti for w in pharma_terms) else YT_LINKS["digital_health"][:4]
     else:
-        # Hospital - mix hospital + research
         links = YT_LINKS["hospital"][:3] + YT_LINKS["research"][:1]
 
     return "\n".join(links)
 
 
-def serper_search(institution: str, name: str) -> str:
-    """Fetch recent news snippets about the institution."""
+def serper_search(institution: str) -> str:
+    """Fetch recent news snippets about the institution from Serper."""
     query = f"{institution} psychiatry mental health news 2025 2026 innovation"
     try:
         resp = requests.post(
@@ -77,36 +86,32 @@ def serper_search(institution: str, name: str) -> str:
             json={"q": query, "num": 5},
             timeout=10,
         )
-        data = resp.json()
-        lines = []
-        for r in data.get("organic", [])[:5]:
-            lines.append(f"- {r.get('title','')}: {r.get('snippet','')}")
+        results = resp.json().get("organic", [])[:5]
+        lines = [f"- {r.get('title', '')}: {r.get('snippet', '')}" for r in results]
         return "\n".join(lines) if lines else "No recent news found."
     except Exception as e:
         return f"Search error: {e}"
 
 
-def generate_hook(name: str, last_name: str, title: str, institution: str,
+def generate_hook(name: str, title: str, institution: str,
                   inst_type: str, reasoning: str, snippets: str) -> str:
-    """Use Groq to write the tailored hook paragraph (the 'We were curious about...' sentence)."""
-
+    """Use Groq to write the tailored hook phrase for the email."""
     prompt = f"""You are writing ONE sentence for a sales email from Ben Varvill at WebsEdge.
 WebsEdge produces documentary videos ($27,500) showcased at the APA Annual Meeting.
-The email is to invite {name} ({title} at {institution}) to be profiled in an APA TV documentary.
+The email invites {name} ({title} at {institution}) to be profiled in an APA TV documentary.
 
-Context about their work (from web search):
+Context from web search:
 {snippets}
 
 Additional notes: {reasoning}
 
-Write ONLY the hook sentence that replaces "We were curious about your latest XXXXXX" in this template:
+Write ONLY the replacement for XXXXXX in this template:
 "We were curious about your latest XXXXXX, which we believe will make an exceptional fit with our focus areas at the APA Annual Meeting this year."
 
 Rules:
-- Replace XXXXXX with something SPECIFIC and REAL about {institution}'s work (a programme, product, initiative, or recent achievement)
-- Use the search results above to make it genuinely specific — not generic
-- Keep it to ONE sentence, completing the template exactly
-- Do NOT include "We were curious about your latest" — just provide the replacement text for XXXXXX
+- Replace XXXXXX with something SPECIFIC about {institution}'s work (a programme, product, or recent achievement)
+- Use the search results to make it genuinely specific — not generic
+- One phrase only — do NOT include "We were curious about your latest"
 - Be specific: e.g. "innovative same-day access psychiatric care model" not "mental health work"
 - Output ONLY the replacement phrase, nothing else"""
 
@@ -114,42 +119,38 @@ Rules:
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "You write precise, specific one-phrase hooks for sales emails. Output only the requested phrase."},
+                {"role": "system", "content": "You write precise, specific hook phrases for sales emails. Output only the requested phrase."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
             max_tokens=120,
         )
         hook = response.choices[0].message.content.strip().strip('"').strip("'")
-        # Clean up any accidental full sentence starts
-        hook = re.sub(r'^(We were curious about your latest\s*)', '', hook, flags=re.IGNORECASE).strip()
+        hook = re.sub(r"^(We were curious about your latest\s*)", "", hook, flags=re.IGNORECASE).strip()
         return hook
-    except Exception as e:
-        return f"[their work in {institution}]"
+    except Exception:
+        return f"their work in {institution}"
 
 
 def get_salutation(name: str, title: str) -> str:
-    """Work out Dear Dr. X vs Dear First Name."""
-    # If they have MD, PhD, Director, Chief etc - use Dr.
+    """Return 'Dr. Last' for medical titles, or first name for everyone else."""
     medical_titles = ["md", "m.d.", "phd", "ph.d.", "psychiatrist", "physician",
                       "medical director", "chief medical", "clinical"]
     if any(t in title.lower() for t in medical_titles):
-        last = name.strip().split()[-1]
-        return f"Dr. {last}"
-    first = name.strip().split()[0]
-    return first
+        return f"Dr. {name.strip().split()[-1]}"
+    return name.strip().split()[0]
 
 
 def build_email(lead: dict, hook: str) -> str:
-    """Assemble the full email from Dear to Ben."""
-    name       = lead["fullName"]
-    title      = lead["title"]
+    """Assemble the full outreach email."""
+    name        = lead["fullName"]
+    title       = lead["title"]
     institution = lead["institution"]
-    inst_type  = lead["institutionType"]
-    salutation = get_salutation(name, title)
-    links      = pick_links(inst_type, title, institution)
+    inst_type   = lead["institutionType"]
+    salutation  = get_salutation(name, title)
+    links       = pick_links(inst_type, title, institution)
 
-    email = f"""Dear {salutation},
+    return f"""Dear {salutation},
 
 I would like to schedule a call between you and Mark Rose, APA TV director, to discuss potentially highlighting {institution} in a pre-recorded video case study within the official broadcast at the American Psychiatric Association (APA) 2026 Annual Meeting in San Francisco (May 16-20, 2026) and online.
 
@@ -174,20 +175,21 @@ I look forward to hearing back from you with a convenient time to speak.
 Best wishes,
 
 Ben"""
-    return email
 
 
 def main():
-    base = "/Users/benvarvill/Downloads/MRA Media work"
-    out_dir = os.path.join(base, "emails")
+    out_dir   = "emails"
+    data_file = "outreach_clear.json"
+    csv_out   = "emails_draft.csv"
+
     os.makedirs(out_dir, exist_ok=True)
 
-    with open(os.path.join(base, "outreach_clear.json")) as f:
+    with open(data_file) as f:
         leads = json.load(f)
 
-    # Filter out private practice (too small, not companies/hospitals in the target sense)
+    # Exclude private practices — too small to be worthwhile leads
     leads = [l for l in leads if "private practice" not in l["institution"].lower()]
-    print(f"\n📧 Generating emails for {len(leads)} leads...\n")
+    print(f"\nGenerating emails for {len(leads)} leads...\n")
 
     results = []
     for i, lead in enumerate(leads, 1):
@@ -197,49 +199,37 @@ def main():
 
         print(f"[{i}/{len(leads)}] {name} @ {institution}")
 
-        # 1. Search for recent news
-        snippets = serper_search(institution, name)
-
-        # 2. Generate hook
-        last_name = name.strip().split()[-1]
-        hook = generate_hook(
-            name, last_name, title, institution,
-            lead["institutionType"], lead.get("reasoning",""), snippets
-        )
+        snippets = serper_search(institution)
+        hook     = generate_hook(name, title, institution,
+                                 lead["institutionType"], lead.get("reasoning", ""), snippets)
         print(f"         Hook: {hook[:80]}...")
 
-        # 3. Build email
         email_text = build_email(lead, hook)
 
-        # 4. Save individual file
-        safe_name = re.sub(r'[^\w\s-]', '', name).strip().replace(' ', '_')
-        filepath = os.path.join(out_dir, f"{i:03d}_{safe_name}.txt")
+        safe_name = re.sub(r"[^\w\s-]", "", name).strip().replace(" ", "_")
+        filepath  = os.path.join(out_dir, f"{i:03d}_{safe_name}.txt")
         with open(filepath, "w") as f:
             f.write(email_text)
 
         results.append({
-            "rank": i,
-            "name": name,
-            "title": title,
-            "institution": institution,
+            "rank":            i,
+            "name":            name,
+            "title":           title,
+            "institution":     institution,
             "institutionType": lead["institutionType"],
-            "tier": lead.get("tier",""),
-            "finalScore": lead.get("finalScore",""),
-            "hook": hook,
-            "email": email_text,
-            "crmNote": lead.get("crmNote",""),
+            "tier":            lead.get("tier", ""),
+            "finalScore":      lead.get("finalScore", ""),
+            "hook":            hook,
+            "email":           email_text,
+            "crmNote":         lead.get("crmNote", ""),
         })
 
-        time.sleep(1.5)  # Serper rate limit
+        time.sleep(1.5)
 
-    # Save CSV of all emails
-    import pandas as pd
-    df = pd.DataFrame(results)
-    csv_path = os.path.join(base, "emails_draft.csv")
-    df.to_csv(csv_path, index=False)
-    print(f"\n✅ Done! {len(results)} emails generated")
-    print(f"   Individual files: {out_dir}/")
-    print(f"   All-in-one CSV:   {csv_path}")
+    pd.DataFrame(results).to_csv(csv_out, index=False)
+    print(f"\nDone — {len(results)} emails generated")
+    print(f"  Individual files: {out_dir}/")
+    print(f"  Summary CSV:      {csv_out}")
 
 
 if __name__ == "__main__":

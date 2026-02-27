@@ -1,70 +1,59 @@
 """
-step3_prepare.py
-================
-Websedge Conference Lead Pipeline — Step 3: Prepare for Ben Leads
-------------------------------------------------------------------
-Takes your reviewed/selected leads from step2 and prepares them for
-copy-paste into the Ben Leads spreadsheet tab.
+Step 3: Generate Ben Leads columns and produce a ready-to-paste spreadsheet.
 
-For each lead:
-  1. Serper.dev  → searches for recent news about the institution + official website URL
-  2. Mistral AI  → generates all Ben Leads text columns from that context:
-       - Focus         (2-4 sentences, what the institution does)
-       - Focus Summary (2-4 word specialty tag)
-       - Area          (clinical area category)
-       - Explanation   (why the institution has financial capacity)
-       - Reason/Value/Return from video
+Takes the leads you've reviewed/selected from step2 and outputs a formatted Excel
+file that can be copied directly into the Ben Leads tracking spreadsheet.
 
-Static columns (no AI needed):
-  - Affinity/10             based on APA appearance count: 1→5, 2→7, 3→7, 4+→10
-  - Affinity Explanation    "X time attendee"
-  - Contact/10              always 10  (never contacted)
-  - Explanation (Contact)   always "Never Contacted"
-  - Potential Lead Overlap? always "No"  (any flags from step2 go into Additional Notes)
-  - Source                  "Attendee List"
-  - Type                    (BP) Big Private / (MP) Medium Private / (SP) Small Private
+For each lead, the script:
+  1. Searches Serper.dev for recent institution news and the official website URL
+  2. Optionally scrapes the institution website for richer content (requires trafilatura)
+  3. Calls Mistral AI to generate: Focus, Focus Summary, Area, Explanation, Video Value
+
+Static columns calculated without AI:
+  - Type (BP/MP/SP) based on budget score
+  - Affinity/10 based on APA appearance count (1->5, 2->7, 3->7, 4+->10)
+  - Contact/10 always 10 (never contacted)
+  - Source always "Attendee List"
 
 Output:
-  {output}_ben_leads.xlsx   ← formatted, ready to copy rows into Ben Leads tab
-  {output}_ben_leads.csv    ← same as CSV backup
+  {output}_ben_leads.xlsx  — two sheets: Ben Leads Ready + Research Notes
+  {output}_ben_leads.csv   — CSV backup
 
 Usage:
   python step3_prepare.py --input apa2026_extra_review.csv --output apa2026_extra
 
-  To run only specific rows, open the review CSV, delete the rows you don't
-  want, save, then point --input at your saved file.
-
-API keys:
-  MISTRAL_API_KEY  — mistral.ai  (text generation)
-  SERPER_API_KEY   — serper.dev  (live institution news + website search)
+API keys (set as environment variables — see .env.example):
+  MISTRAL_API_KEY, SERPER_API_KEY
 """
 
-import argparse, json, os, re, time
+import argparse
+import json
+import os
+import re
+import time
 import pandas as pd
 import requests
 from mistralai import Mistral
 from datetime import date
 
-# Optional: trafilatura gives much richer context by scraping the institution website.
-# Install with:  pip install trafilatura
-# If not installed the script still works — falls back to Serper snippets only.
+
+# trafilatura enables website scraping for richer Focus accuracy.
+# The script works fine without it — falls back to Serper snippets only.
 try:
     import trafilatura
     HAS_TRAFILATURA = True
 except ImportError:
     HAS_TRAFILATURA = False
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
-SERPER_API_KEY  = os.environ.get("SERPER_API_KEY",  "")
+SERPER_API_KEY  = os.environ.get("SERPER_API_KEY", "")
 
-MISTRAL_MODEL   = "mistral-large-latest"   # best quality for hook writing
+MISTRAL_MODEL   = "mistral-large-latest"
 SERPER_ENDPOINT = "https://google.serper.dev/search"
 BATCH_SIZE      = 5
-DELAY           = 1.5   # seconds between Mistral batches
+DELAY           = 1.5  # seconds between Mistral batches
 
-# Domains to skip when picking the official website URL from search results
+# Skip these when picking the official URL from search results
 SOCIAL_DOMAINS = {
     "linkedin.com", "twitter.com", "x.com", "facebook.com",
     "instagram.com", "youtube.com", "wikipedia.org", "indeed.com",
@@ -72,18 +61,13 @@ SOCIAL_DOMAINS = {
     "bloomberg.com", "pitchbook.com", "doximity.com", "healthgrades.com",
 }
 
-# ── Clients ───────────────────────────────────────────────────────────────────
-
 mistral_client = Mistral(api_key=MISTRAL_API_KEY)
 
 
-# ── Serper: institution news + official website in one call ───────────────────
-
 def serper_search_inst(institution: str) -> tuple:
     """
-    One Serper search returns both:
-      - news_snippets  (str)  — for Mistral context
-      - website_url    (str)  — for the Link column (official site, not social media)
+    Search for institution news and official website in a single Serper call.
+    Returns (news_snippets, website_url).
     """
     if not SERPER_API_KEY:
         return ("No news search — SERPER_API_KEY not set.", "")
@@ -97,12 +81,11 @@ def serper_search_inst(institution: str) -> tuple:
         )
         data = resp.json()
 
-        # knowledgeGraph.website is the most reliable official website source
+        # knowledgeGraph.website is the most reliable official URL source
         website = data.get("knowledgeGraph", {}).get("website", "")
 
-        results = data.get("organic", [])[:5]
         lines = []
-        for r in results:
+        for r in data.get("organic", [])[:5]:
             lines.append(f"- {r.get('title', '')}: {r.get('snippet', '')}")
             if not website:
                 url = r.get("link", "")
@@ -117,15 +100,11 @@ def serper_search_inst(institution: str) -> tuple:
         return (f"Search error: {e}", "")
 
 
-# ── Website scraper (no API cost — plain HTTP) ────────────────────────────────
-
 def scrape_website(url: str, max_chars: int = 1500) -> str:
     """
-    Fetch and extract readable text from an institution's website.
+    Fetch and extract readable text from an institution's website (no API cost).
     Returns empty string on any failure — caller falls back to Serper snippets.
-
-    This is a plain HTTP download (no AI, no API cost).
-    Requires:  pip install trafilatura
+    Requires: pip install trafilatura
     """
     if not url or not HAS_TRAFILATURA:
         return ""
@@ -133,81 +112,56 @@ def scrape_website(url: str, max_chars: int = 1500) -> str:
         html = trafilatura.fetch_url(url)
         if not html:
             return ""
-        text = trafilatura.extract(
-            html,
-            include_comments=False,
-            include_tables=False,
-            no_fallback=False,
-        )
+        text = trafilatura.extract(html, include_comments=False, include_tables=False)
         return text[:max_chars].strip() if text else ""
     except Exception:
         return ""
 
 
-# ── Type classification ────────────────────────────────────────────────────────
-
 def classify_type(budget_score: float) -> str:
-    """Map budget score → Ben Leads type code."""
+    """Map budget score to Ben Leads type code."""
     b = float(budget_score or 0)
     if b >= 4: return "(BP) Big Private"
     if b >= 2: return "(MP) Medium Private"
     return "(SP) Small Private"
 
 
-# ── Affinity score (attendance-based only) ─────────────────────────────────────
-
 def affinity_from_appearances(appearances) -> int:
-    """
-    APA appearance count → Affinity/10
-      1  → 5
-      2  → 7
-      3  → 7
-      4+ → 10
-    """
+    """Map APA appearance count to Affinity/10 score."""
     apps = int(float(appearances or 0))
     if apps >= 4: return 10
     if apps >= 2: return 7
-    return 5  # 0 or 1 appearance
+    return 5
 
-
-# ── CRM paste field ────────────────────────────────────────────────────────────
 
 def paste_in_crm(institution: str, focus: str, tracker_theme: str = "USA Private") -> str:
-    """Format the Paste in CRM field exactly as Ben Leads rows do it."""
-    focus_snippet = focus[:120].rstrip()
+    """Format the Paste in CRM field to match the Ben Leads convention."""
     return (
         f"Call for APA\n"
         f"Tracker Theme: {tracker_theme}\n"
         f"Org: {institution}\n"
-        f"Focus: {focus_snippet}"
+        f"Focus: {focus[:120].rstrip()}"
     )
 
 
-# ── Mistral: generate all text columns in one call per batch ─────────────────
-
 def generate_columns(leads_ctx: list) -> list:
     """
-    Generate Focus, Focus Summary, Area, Explanation, and Reason/Value
-    for a list of leads via Mistral.
+    Generate Focus, Focus Summary, Area, Explanation, and Video Value
+    for all leads via Mistral, processed in batches.
 
-    Affinity Explanation is now generated statically as "X time attendee"
-    and is NOT part of this Mistral call (saves tokens).
-
+    Prefers scraped website content over Serper snippets when available.
     Returns a list of dicts in the same order as leads_ctx.
     """
     all_results = []
 
     for i in range(0, len(leads_ctx), BATCH_SIZE):
-        batch = leads_ctx[i : i + BATCH_SIZE]
-
+        batch = leads_ctx[i: i + BATCH_SIZE]
         blocks = []
+
         for j, ctx in enumerate(batch, 1):
-            # Prefer scraped website text (institution's own words) over Serper snippets.
-            # Fall back to snippets when scraping failed.
             if ctx.get("scraped"):
                 institution_context = (
-                    f"Institution website content (their own words — use this as primary source):\n"
-                    f"{ctx['scraped']}\n\n"
+                    f"Institution website content (use as primary source):\n{ctx['scraped']}\n\n"
                     f"Recent news snippets (secondary):\n{ctx['news']}"
                 )
             else:
@@ -231,48 +185,38 @@ def generate_columns(leads_ctx: list) -> list:
             "$27,500 APA TV documentary features showcased at the American Psychiatric "
             "Association Annual Meeting (25,000+ attendees).\n\n"
 
-            "Study these REAL examples from the spreadsheet so you match the exact style:\n\n"
+            "Study these real examples from the spreadsheet to match the exact style:\n\n"
 
-            "EXAMPLE Focus fields (3-5 sentences, starts lowercase, describes what the "
-            "institution does — as if completing 'We were particularly interested in your...'):\n"
-            "  • 'focus on personalized treatment plans and telepsychiatry to increase "
+            "EXAMPLE Focus fields (3-5 sentences, lowercase start, describes what the "
+            "institution does — specific programs, not generic language):\n"
+            "  'focus on personalized treatment plans and telepsychiatry to increase "
             "accessibility, especially your same day access model. We also noted your pathway "
-            "teams using clinical advocacy and care navigation to ensure a bespoke care plan "
-            "that coordinates housing, mental health, and addiction services for vulnerable "
-            "populations'\n"
-            "  • 'high-access, technology-driven care designed to eliminate traditional "
-            "barriers like waitlists and travel. We also noted your same-day access model, "
-            "providing psychiatric evaluations and therapy appointments to address acute "
-            "mental health needs without long wait times'\n"
-            "  • 'measurement-based care technology platform designed to modernise psychiatric "
+            "teams using clinical advocacy and care navigation to coordinate housing, mental "
+            "health, and addiction services for vulnerable populations'\n"
+            "  'measurement-based care technology platform designed to modernise psychiatric "
             "care through clinical intelligence and integrated workflows'\n\n"
 
             "EXAMPLE Focus Summary (2-4 words, lowercase):\n"
-            "  'addiction treatment', 'telepsychiatry', 'mental health research and care', "
-            "'integrated behavioral health'\n\n"
+            "  'addiction treatment', 'telepsychiatry', 'integrated behavioral health'\n\n"
 
-            "EXAMPLE Area (clinical/business category):\n"
+            "EXAMPLE Area:\n"
             "  'Addiction / Substance Use Disorder', 'Telepsychiatry and Digital Health', "
-            "'Child and Adolescent Psychiatry', 'Inpatient Psychiatric Care', "
-            "'Correctional Mental Health', 'Geriatric Psychiatry', 'Clinical Research'\n\n"
+            "'Child and Adolescent Psychiatry', 'Inpatient Psychiatric Care', 'Clinical Research'\n\n"
 
-            "EXAMPLE Explanation (Size-Money — why institution has financial capacity):\n"
-            "  '84 employees', 'well-backed, private equity-supported 51-200 employees', "
-            "'non-profit health system with ~$2B annual revenue', "
+            "EXAMPLE Explanation (why institution has financial capacity):\n"
+            "  '84 employees', 'non-profit health system with ~$2B annual revenue', "
             "'VC-backed digital health startup, Series B funded'\n\n"
 
-            "EXAMPLE Reason/Value/Return from video (what the INSTITUTION gains):\n"
+            "EXAMPLE Reason/Value/Return from video:\n"
             "  'Boosts psychiatry residency recruitment nationally and showcases their "
             "integrated care model to 25,000+ APA attendees'\n\n"
 
-            "Now generate for each person:\n\n"
-            "1. focus — 3-5 sentences, lowercase start, specific to this institution's "
-            "actual programs/approach. Reference the recent news where possible. "
-            "Each sentence should add new information — don't repeat or pad.\n"
-            "2. focusSummary — 2-4 words, lowercase, specialty tag\n"
-            "3. area — clinical area category (match the style of the examples above)\n"
-            "4. explanation — why the institution has financial capacity (size/revenue/backing)\n"
-            "5. videoValue — what the INSTITUTION (not the person) gains from the documentary\n\n"
+            "Generate for each person:\n"
+            "1. focus — 3-5 sentences, lowercase start, specific to this institution\n"
+            "2. focusSummary — 2-4 words, lowercase\n"
+            "3. area — clinical area category\n"
+            "4. explanation — why the institution has financial capacity\n"
+            "5. videoValue — what the INSTITUTION gains from the documentary\n\n"
             f"People:\n\n{'=' * 40}\n" + f"\n{'=' * 40}\n".join(blocks) + "\n\n"
             f"Return a JSON array of exactly {len(batch)} objects. "
             "Keys: focus, focusSummary, area, explanation, videoValue\n"
@@ -285,9 +229,8 @@ def generate_columns(leads_ctx: list) -> list:
                     model=MISTRAL_MODEL,
                     messages=[
                         {"role": "system", "content":
-                            "You write precise, specific content for sales lead spreadsheets. "
-                            "Match the exact tone and style of the examples provided. "
-                            "Return only valid JSON arrays."},
+                            "You write precise content for sales lead spreadsheets. "
+                            "Match the tone and style of the examples. Return only valid JSON arrays."},
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.3,
@@ -295,26 +238,26 @@ def generate_columns(leads_ctx: list) -> list:
                 )
                 text = resp.choices[0].message.content.strip()
                 text = re.sub(r"```(?:json)?\s*", "", text).strip().rstrip("`").strip()
-                m = re.search(r"(\[.*\])", text, re.DOTALL)
-                if m:
-                    text = m.group(1)
+                match = re.search(r"(\[.*\])", text, re.DOTALL)
+                if match:
+                    text = match.group(1)
                 parsed = json.loads(text)
                 if len(parsed) != len(batch):
                     raise ValueError(f"Expected {len(batch)}, got {len(parsed)}")
                 all_results.extend(parsed)
-                names = [ctx['name'] for ctx in batch]
-                foci  = [r.get('focusSummary', '?') for r in parsed]
-                print(f"  ✓ Batch {i//BATCH_SIZE+1}: " +
+                names = [ctx["name"] for ctx in batch]
+                foci  = [r.get("focusSummary", "?") for r in parsed]
+                print(f"  Batch {i // BATCH_SIZE + 1}: " +
                       " | ".join(f"{n.split()[0]}: {f}" for n, f in zip(names, foci)))
                 break
 
             except Exception as e:
                 wait = 10 * (attempt + 1)
                 if attempt < 5:
-                    print(f"  ⏳ Attempt {attempt+1} failed ({str(e)[:60]}) — retrying in {wait}s...")
+                    print(f"  Attempt {attempt + 1} failed ({str(e)[:60]}) — retrying in {wait}s...")
                     time.sleep(wait)
                 else:
-                    print(f"  ✗ All retries failed for batch {i//BATCH_SIZE+1}. Using placeholders.")
+                    print(f"  All retries failed for batch {i // BATCH_SIZE + 1}. Using placeholders.")
                     for ctx in batch:
                         all_results.append({
                             "focus": f"innovative approach to mental health care at {ctx['institution']}",
@@ -329,25 +272,23 @@ def generate_columns(leads_ctx: list) -> list:
     return all_results
 
 
-# ── Build Ben Leads row ────────────────────────────────────────────────────────
-
 def build_row(lead: dict, gen: dict, ctx: dict) -> dict:
-    """Map enriched lead data + generated text into the exact Ben Leads column format."""
-    today         = date.today().strftime("%Y-%m-%d")
-    institution   = str(lead.get("currentInstitution") or lead.get("Institution", ""))
-    title         = str(lead.get("currentTitle") or lead.get("Title", ""))
-    name          = str(lead.get("Name", ""))
-    country       = str(lead.get("Country", ""))
-    state         = str(lead.get("State", ""))
-    appearances   = int(float(lead.get("Appearances", 1) or 1))
-    years         = str(lead.get("Years", ""))
-    budget        = float(lead.get("budgetScore", 0) or 0)
-    is_dm         = bool(lead.get("isDecisionMaker", False))
-    confidence    = str(lead.get("confidence", "low"))
-    tier          = str(lead.get("Tier", ""))
-    final_score   = float(lead.get("FinalScore", 0) or 0)
-    flags         = str(lead.get("FLAGS", "") or "")
-    website       = ctx.get("website", "")
+    """Map enriched lead data and generated text into the Ben Leads column format."""
+    today       = date.today().strftime("%Y-%m-%d")
+    institution = str(lead.get("currentInstitution") or lead.get("Institution", ""))
+    title       = str(lead.get("currentTitle") or lead.get("Title", ""))
+    name        = str(lead.get("Name", ""))
+    country     = str(lead.get("Country", ""))
+    state       = str(lead.get("State", ""))
+    appearances = int(float(lead.get("Appearances", 1) or 1))
+    years       = str(lead.get("Years", ""))
+    budget      = float(lead.get("budgetScore", 0) or 0)
+    is_dm       = bool(lead.get("isDecisionMaker", False))
+    confidence  = str(lead.get("confidence", "low"))
+    tier        = str(lead.get("Tier", ""))
+    final_score = float(lead.get("FinalScore", 0) or 0)
+    flags       = str(lead.get("FLAGS", "") or "")
+    website     = ctx.get("website", "")
 
     focus         = gen.get("focus", "")
     focus_summary = gen.get("focusSummary", "")
@@ -355,15 +296,13 @@ def build_row(lead: dict, gen: dict, ctx: dict) -> dict:
     explanation   = gen.get("explanation", "")
     video_value   = gen.get("videoValue", "")
 
-    size_money   = min(int(budget * 2), 10)
     affinity     = affinity_from_appearances(appearances)
     affinity_exp = f"{appearances} time attendee"
+    size_money   = min(int(budget * 2), 10)
 
-    # Additional Notes: pipeline metadata + any step2 flags
     notes_parts = [f"Tier {tier}", f"Score {final_score:.1f}", f"Confidence: {confidence}"]
     if flags:
         notes_parts.append(f"Flags: {flags}")
-    additional_notes = " | ".join(notes_parts)
 
     return {
         "Date":                           today,
@@ -397,44 +336,37 @@ def build_row(lead: dict, gen: dict, ctx: dict) -> dict:
         "Potential Lead Overlap?":        "No",
         "Reason/Value/Return from video": video_value,
         "Decision Maker?":                "Yes" if is_dm else "Maybe",
-        "Additional Notes":               additional_notes,
+        "Additional Notes":               " | ".join(notes_parts),
         "Autocheck Fellows":              0,
         "Paste in CRM":                   paste_in_crm(institution, focus),
     }
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
 def main():
-    parser = argparse.ArgumentParser(description="Websedge Step 3 — Prepare Ben Leads")
-    parser.add_argument("--input",  required=True,       help="Reviewed CSV from step2 (your selected leads)")
-    parser.add_argument("--output", default="prepared",  help="Output filename prefix")
+    parser = argparse.ArgumentParser(description="Step 3: generate Ben Leads output")
+    parser.add_argument("--input",  required=True,      help="Reviewed CSV/XLSX from step2")
+    parser.add_argument("--output", default="prepared", help="Output filename prefix")
     args = parser.parse_args()
 
-    print(f"\n📂 Loading {args.input}...")
+    print(f"\nLoading {args.input}...")
     if args.input.lower().endswith(".xlsx"):
         df = pd.read_excel(args.input, sheet_name="Review Leads")
     else:
         df = pd.read_csv(args.input)
-    print(f"   {len(df)} leads to prepare")
+    print(f"  {len(df)} leads to prepare")
 
     if not SERPER_API_KEY:
-        print("   ⚠ SERPER_API_KEY not set — news search disabled. Hooks will be Mistral-only.")
+        print("  Warning: SERPER_API_KEY not set — news search disabled")
     if not HAS_TRAFILATURA:
-        print("   ℹ  trafilatura not installed — website scraping disabled.")
-        print("      Run:  pip install trafilatura   to enable richer Focus accuracy.")
+        print("  Note: trafilatura not installed — website scraping disabled")
+        print("        Run: pip install trafilatura  to enable richer Focus accuracy")
 
-    # ── Build context for each lead ───────────────────────────────────────────
-    print("\n🔍 Searching institution news + scraping websites via Serper...")
+    # Build research context for each lead
+    print("\nSearching institution news and scraping websites...")
     contexts = []
     for _, row in df.iterrows():
         inst = str(row.get("currentInstitution") or row.get("Institution", ""))
-
-        # 1. Serper: get news snippets + official website URL
         news, website = serper_search_inst(inst)
-
-        # 2. Scrape the website for richer program descriptions (free HTTP — no API)
-        #    This is the primary source for Focus accuracy when available.
         scraped = scrape_website(website) if website else ""
 
         fin = str(row.get("financialCapacity", "") or "")
@@ -452,69 +384,62 @@ def main():
             "reasoning":          str(row.get("reasoning", "")),
             "news":               news,
             "website":            website,
-            "scraped":            scraped,      # website full text (empty if scrape failed)
+            "scraped":            scraped,
         })
 
-        # Status line: show what we got for this lead
         if scraped:
-            src = f"✓ scraped ({len(scraped)} chars)"
+            source_note = f"website scraped ({len(scraped)} chars)"
         elif news and not news.startswith("No recent"):
-            src = "~ Serper snippets only"
+            source_note = "Serper snippets only"
         else:
-            src = "⚠ no source — verify manually"
-        print(f"   {inst[:40]:<40} {src}")
-        time.sleep(0.3)   # gentle rate limiting
+            source_note = "no source — verify manually"
+        print(f"  {inst[:40]:<40}  {source_note}")
+        time.sleep(0.3)
 
-    # ── Generate all text columns via Mistral ─────────────────────────────────
-    print(f"\n🤖 Generating Ben Leads columns via Mistral ({MISTRAL_MODEL})...")
+    # Generate AI text columns
+    print(f"\nGenerating Ben Leads columns via Mistral ({MISTRAL_MODEL})...")
     generated = generate_columns(contexts)
 
-    # ── Build output rows ─────────────────────────────────────────────────────
-    print("\n📝 Building Ben Leads rows...")
-    rows = []
-    for lead_row, gen, ctx in zip(df.to_dict(orient="records"), generated, contexts):
-        rows.append(build_row(lead_row, gen, ctx))
+    # Build output rows
+    print("\nBuilding rows...")
+    rows = [build_row(lead, gen, ctx)
+            for lead, gen, ctx in zip(df.to_dict(orient="records"), generated, contexts)]
 
     df_out = pd.DataFrame(rows)
 
-    # ── Save CSV ───────────────────────────────────────────────────────────────
     csv_path  = f"{args.output}_ben_leads.csv"
     xlsx_path = f"{args.output}_ben_leads.xlsx"
     df_out.to_csv(csv_path, index=False)
 
-    # ── Save Excel matching Ben Leads tab style ────────────────────────────────
-    # Build Research Notes dataframe (one row per lead — shows what sources were used)
-    research_rows = []
-    for ctx in contexts:
-        news_text   = ctx.get("news", "")
-        scraped     = ctx.get("scraped", "")
-        has_news    = news_text not in ("No recent news found.", "") and not news_text.startswith("Search error")
-        has_scraped = bool(scraped)
-
-        if has_scraped:
-            quality = "✓ Website scraped — highest accuracy"
-        elif has_news:
-            quality = "~ Serper snippets only — good accuracy"
-        else:
-            quality = "⚠ No source data — verify Focus manually"
-
-        research_rows.append({
-            "Institution":       ctx["institution"],
-            "Contact Name":      ctx["name"],
-            "Website Found":     ctx.get("website", "") or "—",
-            "Source Quality":    quality,
-            "Website Content":   scraped[:600] + "…" if len(scraped) > 600 else scraped or "—",
-            "Serper Snippets":   news_text,
-        })
-    df_research = pd.DataFrame(research_rows)
-
-    # Which row indices (0-based) have NO source at all? (for orange highlighting)
+    # Rows with no source data — highlighted orange in the output Excel
     no_news_rows = {
         i for i, ctx in enumerate(contexts)
         if not ctx.get("scraped")
         and (ctx.get("news", "") in ("No recent news found.", "")
              or ctx.get("news", "").startswith("Search error"))
     }
+
+    # Research Notes tab shows exactly what was used to generate each Focus
+    research_rows = []
+    for ctx in contexts:
+        news_text = ctx.get("news", "")
+        scraped   = ctx.get("scraped", "")
+        has_news  = news_text not in ("No recent news found.", "") and not news_text.startswith("Search error")
+        if scraped:
+            quality = "Website scraped — highest accuracy"
+        elif has_news:
+            quality = "Serper snippets only — good accuracy"
+        else:
+            quality = "No source data — verify Focus manually"
+        research_rows.append({
+            "Institution":     ctx["institution"],
+            "Contact Name":    ctx["name"],
+            "Website Found":   ctx.get("website", "") or "—",
+            "Source Quality":  quality,
+            "Website Content": (scraped[:600] + "…" if len(scraped) > 600 else scraped) or "—",
+            "Serper Snippets": news_text,
+        })
+    df_research = pd.DataFrame(research_rows)
 
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
         df_out.to_excel(writer, sheet_name="Ben Leads Ready", index=False)
@@ -523,36 +448,26 @@ def main():
         from openpyxl.styles import PatternFill, Font, Alignment
         from openpyxl.utils import get_column_letter
 
-        # ── Ben Leads Ready sheet ──────────────────────────────────────────────
-        ws = writer.sheets["Ben Leads Ready"]
+        fill_a      = PatternFill("solid", fgColor="FFFFFF")
+        fill_b      = PatternFill("solid", fgColor="F2F2F2")
+        fill_nonews = PatternFill("solid", fgColor="FFE0B2")
+        hdr_fill    = PatternFill("solid", fgColor="1F4E79")
+        hdr_font    = Font(bold=True, color="FFFFFF", size=9)
 
-        # Header row
-        hdr_fill = PatternFill("solid", fgColor="1F4E79")
-        hdr_font = Font(bold=True, color="FFFFFF", size=9)
+        ws = writer.sheets["Ben Leads Ready"]
         for cell in ws[1]:
             cell.fill = hdr_fill
             cell.font = hdr_font
             cell.alignment = Alignment(horizontal="center", wrap_text=True)
         ws.row_dimensions[1].height = 35
 
-        # Row colours: orange = no news found (verify Focus manually)
-        #              alternating white/grey = normal rows
-        fill_a      = PatternFill("solid", fgColor="FFFFFF")
-        fill_b      = PatternFill("solid", fgColor="F2F2F2")
-        fill_nonews = PatternFill("solid", fgColor="FFE0B2")   # pale orange
         for row_idx in range(2, ws.max_row + 1):
-            data_idx = row_idx - 2   # 0-based
-            if data_idx in no_news_rows:
-                fill = fill_nonews
-            else:
-                fill = fill_a if row_idx % 2 == 0 else fill_b
+            data_idx = row_idx - 2
+            fill = fill_nonews if data_idx in no_news_rows else (fill_a if row_idx % 2 == 0 else fill_b)
             for col_idx in range(1, ws.max_column + 1):
                 ws.cell(row=row_idx, column=col_idx).fill = fill
-                ws.cell(row=row_idx, column=col_idx).alignment = Alignment(
-                    wrap_text=True, vertical="top"
-                )
+                ws.cell(row=row_idx, column=col_idx).alignment = Alignment(wrap_text=True, vertical="top")
 
-        # Column widths
         col_widths = {
             "Date": 12, "Country": 8, "State": 6, "Institution": 30,
             "Center Name": 20, "Type": 16, "Position of Lead": 30,
@@ -569,65 +484,37 @@ def main():
             "Autocheck Fellows": 12, "Paste in CRM": 40,
         }
         for col_idx, col_name in enumerate(df_out.columns, start=1):
-            letter = get_column_letter(col_idx)
-            ws.column_dimensions[letter].width = col_widths.get(col_name, 15)
-
+            ws.column_dimensions[get_column_letter(col_idx)].width = col_widths.get(col_name, 15)
         for row_idx in range(2, ws.max_row + 1):
             ws.row_dimensions[row_idx].height = 65
-
         ws.freeze_panes = "A2"
 
-        # ── Research Notes sheet ───────────────────────────────────────────────
         wr = writer.sheets["Research Notes"]
-
-        # Header
         for cell in wr[1]:
             cell.fill = PatternFill("solid", fgColor="2E7D32")
             cell.font = Font(bold=True, color="FFFFFF", size=9)
             cell.alignment = Alignment(horizontal="center", wrap_text=True)
         wr.row_dimensions[1].height = 30
-
-        # Rows — highlight no-news rows orange
         for row_idx in range(2, wr.max_row + 1):
             data_idx = row_idx - 2
-            row_fill = fill_nonews if data_idx in no_news_rows else fill_a
             for col_idx in range(1, wr.max_column + 1):
-                wr.cell(row=row_idx, column=col_idx).fill = row_fill
-                wr.cell(row=row_idx, column=col_idx).alignment = Alignment(
-                    wrap_text=True, vertical="top"
-                )
-
-        wr.column_dimensions["A"].width = 35   # Institution
-        wr.column_dimensions["B"].width = 22   # Contact Name
-        wr.column_dimensions["C"].width = 40   # Website Found
-        wr.column_dimensions["D"].width = 30   # Source Quality
-        wr.column_dimensions["E"].width = 60   # Website Content
-        wr.column_dimensions["F"].width = 70   # Serper Snippets
+                wr.cell(row=row_idx, column=col_idx).fill = fill_nonews if data_idx in no_news_rows else fill_a
+                wr.cell(row=row_idx, column=col_idx).alignment = Alignment(wrap_text=True, vertical="top")
+        for col, width in [("A", 35), ("B", 22), ("C", 40), ("D", 30), ("E", 60), ("F", 70)]:
+            wr.column_dimensions[col].width = width
         for row_idx in range(2, wr.max_row + 1):
             wr.row_dimensions[row_idx].height = 70
-
         wr.freeze_panes = "A2"
 
-    scraped_count  = sum(1 for ctx in contexts if ctx.get("scraped"))
+    scraped_count   = sum(1 for ctx in contexts if ctx.get("scraped"))
     no_source_count = len(no_news_rows)
-    print(f"""
-╔══════════════════════════════════════════╗
-║       STEP 3 PREPARE COMPLETE            ║
-╠══════════════════════════════════════════╣
-║  Leads prepared  : {len(rows):<21} ║
-║  Website scraped : {scraped_count:<21} ║
-║  No source found : {no_source_count:<21} ║
-║  Output Excel    : {xlsx_path:<21} ║
-║  Output CSV      : {csv_path:<21} ║
-╚══════════════════════════════════════════╝
 
-📋 Open {xlsx_path}:
-   • "Ben Leads Ready" tab  — copy rows into Ben Leads spreadsheet
-   • "Research Notes" tab   — shows exactly what was used to write each Focus:
-       ✓ Website scraped  = Focus written from institution's own website text
-       ~ Serper only      = Focus written from search snippets
-       ⚠ Orange rows      = no source found; worth a quick manual check
-    """)
+    print(f"\nStep 3 complete — {len(rows)} leads prepared")
+    print(f"  Website scraped: {scraped_count}")
+    print(f"  No source found: {no_source_count} (orange rows — worth a manual check)")
+    print(f"\nOutput: {xlsx_path}")
+    print(f"  'Ben Leads Ready' tab — copy rows into Ben Leads spreadsheet")
+    print(f"  'Research Notes' tab  — shows what was used to write each Focus")
 
 
 if __name__ == "__main__":

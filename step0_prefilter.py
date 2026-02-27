@@ -1,41 +1,31 @@
 """
-step0_prefilter.py
-==================
-Websedge Conference Lead Pipeline — Step 0: Pre-filter (before AI enrichment)
--------------------------------------------------------------------------------
-Removes obvious non-leads BEFORE step1 runs, saving Groq + Serper API calls.
-Zero API calls — all filtering is instant keyword/list-based logic.
+Step 0: Pre-filter raw attendee data before AI enrichment.
 
-Hard removes (never reach step1):
-  - Pharma companies     (name keywords + known company list)
-  - DNC institutions     (DO NOT CONTACT tab in APA 20XX.xlsx)
-  - Non-US leads         (Ben focuses on US private — override with --keep-all-countries)
+Removes obvious non-leads using instant keyword/list checks — no API calls needed.
+Run this first to reduce the number of records sent to step1, saving Groq and Serper quota.
 
-Soft flags only (kept, noted in output for step2 to confirm):
-  - POSSIBLE_PUBLIC      (state hospital / county / VA keywords in name)
+Hard removes:
+  - Pharma companies (keyword match + known company list)
+  - DO NOT CONTACT institutions (from APA 20XX.xlsx reference sheet)
+  - Non-US leads (override with --keep-all-countries if needed)
 
-Use --limit N to test on the first N rows before running the full batch.
+Soft flags (kept, noted for step2 to confirm):
+  - POSSIBLE_PUBLIC — state hospitals, county hospitals, VA centres
 
 Usage:
-  # Full run
   python step0_prefilter.py --input Extra2000Leads.csv --output apa2026_extra
-
-  # Test on first 400 leads
   python step0_prefilter.py --input Extra2000Leads.csv --output test400 --limit 400
 
-  # Keep non-US leads too
-  python step0_prefilter.py --input Extra2000Leads.csv --output apa2026_extra --keep-all-countries
-
-Next step after this:
+Output feeds directly into step1:
   python step1_enrich.py --input {output}_step1_input.csv --output {output}
 """
 
-import argparse, re
+import argparse
+import re
 import pandas as pd
 
-DEFAULT_XLSX = "/Users/benvarvill/Downloads/MRA Media work/APA 2026.xlsx"
 
-# ── Filter lists (same source of truth as step2) ─────────────────────────────
+DEFAULT_XLSX = "APA 2026.xlsx"
 
 PHARMA_KNOWN = {
     "boehringer ingelheim", "bristol myers squibb", "bristol-myers squibb",
@@ -46,10 +36,12 @@ PHARMA_KNOWN = {
     "abbvie", "pfizer", "eli lilly", "astrazeneca", "novartis",
     "roche", "merck", "lundbeck", "sunovion", "acadia", "axsome",
 }
+
 PHARMA_KEYWORDS = [
     "pharmaceutical", "pharma", " biosciences", "biopharma",
     " therapeutics", "biologics",
 ]
+
 PUBLIC_KEYWORDS = [
     "state hospital", "state psychiatric", "state mental health",
     "county hospital", "county mental health", "veterans affairs",
@@ -59,126 +51,110 @@ PUBLIC_KEYWORDS = [
 US_VALUES = {"usa", "united states", "us"}
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _norm(s: str) -> str:
+def normalise(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).lower().strip())
 
 
-def is_pharma(inst: str) -> bool:
-    il = _norm(inst)
-    return any(k in il for k in PHARMA_KNOWN) or any(k in il for k in PHARMA_KEYWORDS)
+def is_pharma(institution: str) -> bool:
+    inst = normalise(institution)
+    return any(k in inst for k in PHARMA_KNOWN) or any(k in inst for k in PHARMA_KEYWORDS)
 
 
-def is_possible_public(inst: str) -> bool:
-    """Soft flag — step2 does definitive check once institutionType is known."""
-    il = _norm(inst)
-    return any(k in il for k in PUBLIC_KEYWORDS)
+def is_possible_public(institution: str) -> bool:
+    """Soft flag only — step2 applies the definitive public hospital check."""
+    inst = normalise(institution)
+    return any(k in inst for k in PUBLIC_KEYWORDS)
 
 
 def load_dnc(xlsx_path: str) -> set:
+    """Load the DO NOT CONTACT list from the reference spreadsheet."""
     try:
         df = pd.read_excel(xlsx_path, sheet_name="DO NOT CONTACT", header=None)
-        return {_norm(v) for v in df[0].dropna()}
+        return {normalise(v) for v in df[0].dropna()}
     except Exception as e:
-        print(f"  ⚠  Could not load DO NOT CONTACT tab: {e}")
+        print(f"Warning: could not load DO NOT CONTACT tab: {e}")
         return set()
 
 
-def is_dnc(inst: str, dnc_set: set) -> bool:
-    il = _norm(inst)
-    return any(d in il or il in d for d in dnc_set if d)
+def is_dnc(institution: str, dnc_set: set) -> bool:
+    inst = normalise(institution)
+    return any(d in inst or inst in d for d in dnc_set if d)
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Websedge Step 0 — Pre-filter before AI enrichment")
+    parser = argparse.ArgumentParser(description="Step 0: pre-filter attendees before AI enrichment")
     parser.add_argument("--input",               required=True,          help="Raw attendee CSV")
     parser.add_argument("--output",              default="prefiltered",  help="Output filename prefix")
-    parser.add_argument("--xlsx",                default=DEFAULT_XLSX,   help="Path to APA 20XX.xlsx")
-    parser.add_argument("--limit",               type=int, default=None, help="Only use first N rows (test mode)")
-    parser.add_argument("--keep-all-countries",  action="store_true",    help="Keep non-US leads (default: non-US removed)")
+    parser.add_argument("--xlsx",                default=DEFAULT_XLSX,   help="Path to APA reference spreadsheet")
+    parser.add_argument("--limit",               type=int, default=None, help="Only process first N rows (for testing)")
+    parser.add_argument("--keep-all-countries",  action="store_true",    help="Keep non-US leads (default: US only)")
     args = parser.parse_args()
 
     us_only = not args.keep_all_countries
 
-    print(f"\n📂 Loading {args.input}...")
+    print(f"\nLoading {args.input}...")
     df = pd.read_csv(args.input)
 
     if args.limit:
         df = df.head(args.limit)
-        print(f"   ⚡ Test mode: using first {len(df)} rows (of {args.limit} requested)")
+        print(f"  Test mode: {len(df)} rows")
     else:
-        print(f"   {len(df)} total records")
+        print(f"  {len(df)} total records")
 
-    print(f"\n📋 Loading reference data from {args.xlsx}...")
+    print(f"Loading reference data from {args.xlsx}...")
     dnc_set = load_dnc(args.xlsx)
-    print(f"   {len(dnc_set)} DO NOT CONTACT entries")
+    print(f"  {len(dnc_set)} DO NOT CONTACT entries")
     if us_only:
-        print("   🌍 Non-US leads will be removed (pass --keep-all-countries to override)")
+        print("  Non-US leads will be removed (pass --keep-all-countries to override)")
 
-    # ── Apply filters ─────────────────────────────────────────────────────────
-    print("\n🔍 Filtering...")
-    kept    = []
+    kept = []
     removed = []
 
     for _, row in df.iterrows():
-        inst    = str(row.get("Institution", "") or "")
+        institution = str(row.get("Institution", "") or "")
         country = str(row.get("Country", "") or "").strip()
-        reason  = None
+        remove_reason = None
 
-        if us_only and _norm(country) not in US_VALUES and country != "":
-            reason = f"NON_US ({country})"
-        elif is_pharma(inst):
-            reason = "PHARMA"
-        elif is_dnc(inst, dnc_set):
-            reason = "DO_NOT_CONTACT"
+        if us_only and normalise(country) not in US_VALUES and country != "":
+            remove_reason = f"NON_US ({country})"
+        elif is_pharma(institution):
+            remove_reason = "PHARMA"
+        elif is_dnc(institution, dnc_set):
+            remove_reason = "DO_NOT_CONTACT"
 
-        r = row.to_dict()
-        if reason:
-            r["removeReason"] = reason
-            removed.append(r)
+        record = row.to_dict()
+        if remove_reason:
+            record["removeReason"] = remove_reason
+            removed.append(record)
         else:
-            if is_possible_public(inst):
-                r["_preFlag"] = "POSSIBLE_PUBLIC"   # step2 will confirm
-            kept.append(r)
+            if is_possible_public(institution):
+                record["_preFlag"] = "POSSIBLE_PUBLIC"
+            kept.append(record)
 
-    df_kept    = pd.DataFrame(kept)
+    df_kept = pd.DataFrame(kept)
     df_removed = pd.DataFrame(removed)
 
-    # ── Save outputs ──────────────────────────────────────────────────────────
-    step1_path   = f"{args.output}_step1_input.csv"
+    step1_path = f"{args.output}_step1_input.csv"
     removed_path = f"{args.output}_pre_removed.csv"
 
     df_kept.to_csv(step1_path, index=False)
     if not df_removed.empty:
         df_removed.to_csv(removed_path, index=False)
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    pharma_ct  = sum(1 for r in removed if "PHARMA"        in r.get("removeReason",""))
-    dnc_ct     = sum(1 for r in removed if "DO_NOT"        in r.get("removeReason",""))
-    non_us_ct  = sum(1 for r in removed if "NON_US"        in r.get("removeReason",""))
-    pub_fl_ct  = sum(1 for r in kept    if r.get("_preFlag") == "POSSIBLE_PUBLIC")
-    saved_pct  = round(len(removed) / len(df) * 100) if len(df) else 0
+    pharma_ct = sum(1 for r in removed if "PHARMA" in r.get("removeReason", ""))
+    dnc_ct = sum(1 for r in removed if "DO_NOT" in r.get("removeReason", ""))
+    non_us_ct = sum(1 for r in removed if "NON_US" in r.get("removeReason", ""))
+    pub_flag_ct = sum(1 for r in kept if r.get("_preFlag") == "POSSIBLE_PUBLIC")
+    saved_pct = round(len(removed) / len(df) * 100) if len(df) else 0
 
-    print(f"""
-╔══════════════════════════════════════════╗
-║      STEP 0 PRE-FILTER COMPLETE          ║
-╠══════════════════════════════════════════╣
-║  Input records    : {len(df):<20} ║
-║  ✗ Removed        : {len(removed):<20} ║
-║     Pharma        : {pharma_ct:<20} ║
-║     DNC           : {dnc_ct:<20} ║
-║     Non-US        : {non_us_ct:<20} ║
-║  ~ Kept for step1 : {len(kept):<20} ║
-║     Possible pub. : {pub_fl_ct:<20} ║
-║  API calls saved  : ~{len(removed)} ({saved_pct}%){' ' * max(0,15-len(f'{len(removed)} ({saved_pct}%)'))} ║
-╚══════════════════════════════════════════╝
-
-▶  Next:
-   python step1_enrich.py --input {step1_path} --output {args.output}
-    """)
+    print(f"\nPre-filter complete")
+    print(f"  Input:          {len(df)}")
+    print(f"  Removed:        {len(removed)} ({saved_pct}% of API calls saved)")
+    print(f"    Pharma:       {pharma_ct}")
+    print(f"    DNC:          {dnc_ct}")
+    print(f"    Non-US:       {non_us_ct}")
+    print(f"  Kept for step1: {len(kept)} (of which {pub_flag_ct} soft-flagged as possible public)")
+    print(f"\nNext: python step1_enrich.py --input {step1_path} --output {args.output}")
 
 
 if __name__ == "__main__":

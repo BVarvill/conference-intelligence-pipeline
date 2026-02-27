@@ -1,18 +1,17 @@
 """
-merge_results.py
-================
-Combines the 5 daily enriched CSV files into one master ranked file.
+Merge multiple daily enriched CSV files into a single ranked output.
+
+Expects files matching the pattern enriched_day*.csv in the current directory.
+Deduplicates by name (keeps the first/highest-scoring occurrence), re-ranks globally,
+and assigns A/B/C/D tiers.
 
 Usage:
   python merge_results.py
-
-Expects files named enriched_day1.csv through enriched_day5.csv in the
-same folder. Outputs:
-  - enriched_all.csv   (all records, sorted by FinalScore descending)
 """
 
 import glob
 import pandas as pd
+
 
 INPUT_PATTERN = "enriched_day*.csv"
 OUTPUT_FILE   = "enriched_all.csv"
@@ -40,37 +39,30 @@ def main():
         print(f"  {f}: {len(df)} records")
 
     combined = pd.concat(frames, ignore_index=True)
-    print(f"\nTotal records before dedup: {len(combined)}")
+    print(f"\n  Total before dedup: {len(combined)}")
 
-    # Drop duplicates — keep the first occurrence (highest-scoring day's result)
+    # Keep first occurrence per name (highest-scoring day's result comes first)
     combined = combined.drop_duplicates(subset=["Name"], keep="first")
-    print(f"Total records after dedup:  {len(combined)}")
+    print(f"  Total after dedup:  {len(combined)}")
 
-    # Re-sort and re-rank globally
     combined = combined.sort_values("FinalScore", ascending=False).reset_index(drop=True)
     combined["Tier"] = combined["FinalScore"].apply(assign_tier)
     combined["Rank"] = combined.index + 1
 
     combined.to_csv(OUTPUT_FILE, index=False)
-    print(f"\nSaved → {OUTPUT_FILE}")
+    print(f"\nSaved: {OUTPUT_FILE}")
 
-    # Summary
-    tiers = combined["Tier"].value_counts().reindex(["A","B","C","D"], fill_value=0)
-    print(f"""
-╔══════════════════════════════════════════╗
-║           MERGE COMPLETE                 ║
-╠══════════════════════════════════════════╣
-║  Total records           : {len(combined):<14} ║
-║  Tier A (email first)    : {tiers['A']:<14} ║
-║  Tier B (worth contacting: {tiers['B']:<14} ║
-║  Tier C (possible)       : {tiers['C']:<14} ║
-║  Tier D (low priority)   : {tiers['D']:<14} ║
-╚══════════════════════════════════════════╝
-    """)
+    tiers = combined["Tier"].value_counts().reindex(["A", "B", "C", "D"], fill_value=0)
+    print(f"\n  Total: {len(combined)}")
+    print(f"  Tier A (email first):   {tiers['A']}")
+    print(f"  Tier B (worth contact): {tiers['B']}")
+    print(f"  Tier C (possible):      {tiers['C']}")
+    print(f"  Tier D (low priority):  {tiers['D']}")
 
-    print("Top 15 leads:")
-    cols = ["Rank", "Tier", "Name", "currentTitle", "currentInstitution", "budgetScore", "decisionMakerScore", "FinalScore"]
+    cols = ["Rank", "Tier", "Name", "currentTitle", "currentInstitution",
+            "budgetScore", "decisionMakerScore", "FinalScore"]
     available = [c for c in cols if c in combined.columns]
+    print(f"\nTop 15:")
     print(combined[available].head(15).to_string(index=False))
 
 
